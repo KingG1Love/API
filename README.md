@@ -22,5 +22,5 @@
 
 ## Структура файлов
 - `task_1.py`: Парсит страницу Apple Security Advisories.
-- `task_2.py`: Опрашивает MITRE API для обогащения данных CVSS, CPE, CWE.
-- `task_3.py`: Преобразует JSON-данные в XML.
+- `task_2.py`: Опрашивает MITRE API и NVD API для обогащения данных CVSS, CPE, CWE.
+- `task_3.py`: Преобразует JSON-данные в XML.   
