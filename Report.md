@@ -79,3 +79,15 @@
       <cwe id="CWE-377" name="Insecure Temporary File">Creating and using insecure temporary files can leave application and system data vulnerable to attack.</cwe>
     </cwe_list>
   </vulnerability>
+
+## Задача 4: Валидация JSON
+
+**Инструменты:** Python, библиотека jsonschema (Draft202012Validator). Была написана JSON Schema, которая проверяет: все поля первого уровня (ID, url, description и т.д.) обязательны и непусты, cvss_list и cpe_list содержат минимум 1 элемент, cwe содержит минимум 1 ключ формата CWE-\d+. Скрипт task_4.py загружает схему и result_task_2.json, запускает валидатор и при ошибках выводит конкретные CVE-ID с пустыми полями.
+**Сложности:** Часть CVE от Apple не имеет CVSS или CPE в базах MITRE/NVD — для них валидация по minItems: 1 не проходит. Это ожидаемое поведение: данных в природе нет, а не ошибка парсера. Скрипт явно перечисляет такие CVE в выводе.
+**Решение:** В отчёте валидации перечислены все CVE с пустыми полями. Для прохождения проверки такие уязвимости можно либо обогатить данными из альтернативных источников, либо ослабить ограничение до minItems: 0 для необязательных полей.
+
+## Задача 5: База данных
+
+**Инструменты:** PostgreSQL 16, Python, библиотека psycopg3, Docker Compose. БД нормализована до 3НФ и состоит из 6 таблиц: vulnerability (основная, 1 строка = 1 CVE), cvss_score (многие к одному), cpe и cwe — справочники уникальных строк, vulnerability_cpe и vulnerability_cwe — связи M:M. PostgreSQL поднимается через docker-compose.yml, схема применяется автоматически при старте контейнера через docker-entrypoint-initdb.d. Скрипт fill_db.py заполняет БД из result_task_2.json.
+**Сложности:** Повторный запуск скрипта без защиты вызывал бы ошибки уникальности. 
+**Решение:** Все INSERT используют ON CONFLICT DO UPDATE (upsert), поэтому скрипт можно запускать многократно без ошибок.
