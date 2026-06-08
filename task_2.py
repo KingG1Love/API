@@ -10,12 +10,10 @@ MITRE_CVE_URL = "https://cveawg.mitre.org/api/cve/{cve_id}"
 NVD_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
 CWE_API_URL = "https://cwe-api.mitre.org/api/v1/cwe/weakness/{cwe_num}"
 
-# Настройки потоков
-MAX_WORKERS_CVE = 8  # Для сбора CVE
-MAX_WORKERS_CWE = 5  # Для сбора CWE
+MAX_WORKERS_CVE = 8
+MAX_WORKERS_CWE = 5
 NVD_RETRY_WAIT = 7
 
-# ── Thread-local session ───────────────────────────────────────────────────────
 _local = threading.local()
 
 
@@ -28,52 +26,78 @@ def get_session() -> requests.Session:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Обогащение CVE и генерация CPE
+# CPE helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def expand_cpe_range(base_cpe: str, end_version: str, is_excluding: bool) -> list[str]:
-    """
-    Разворачивает диапазон до конкретной версии (end_version) в список CPE
-    в рамках одной мажорной версии.
-    Пример: end_version="16.4.1" -> генерирует версии 16.0, 16.1, 16.2, 16.3, 16.4.
-    """
+def expand_cpe_range(base_cpe: str, end_version: str, is_excluding: bool) -> list:
     expanded = []
     parts = end_version.split('.')
-
-    # Если версия не похожа на стандартную X.Y (например, просто строка или дата),
-    # возвращаем базовый CPE с припиской.
     if not (len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit()):
         return [f"{base_cpe} (до {end_version})"]
 
     major = parts[0]
     minor = int(parts[1])
-
     cpe_parts = base_cpe.split(':')
 
     def make_cpe(ver: str) -> str:
-
         if len(cpe_parts) >= 6 and cpe_parts[5] == '*':
             new_cpe = list(cpe_parts)
             new_cpe[5] = ver
             return ':'.join(new_cpe)
         return f"{base_cpe} (v{ver})"
 
-    # Генерируем минорные версии от 0 до minor-1
     for m in range(minor):
         expanded.append(make_cpe(f"{major}.{m}"))
 
-    # Если 'Including', то последняя минорная версия тоже уязвима
     if not is_excluding:
         expanded.append(make_cpe(f"{major}.{minor}"))
-    # Если 'Excluding', но есть патч-версия (например, исправление в 16.4.1),
-    # значит вся ветка 16.4.0 была уязвима, добавляем 16.4
     elif is_excluding and len(parts) >= 3 and parts[2].isdigit() and int(parts[2]) > 0:
         expanded.append(make_cpe(f"{major}.{minor}"))
 
     return expanded
 
 
-def fetch_from_nvd(cve_id: str) -> tuple[list, list]:
+def build_cpe_from_affected(affected: list) -> list:
+    """
+    Строит CPE-строки из cna.affected, когда NVD не вернул configurations.
+    Формат: cpe:2.3:<part>:<vendor>:<product>:<version>:*:*:*:*:*:*:*
+    """
+    cpe_entries = []
+    for entry in affected:
+        vendor = entry.get('vendor', '').lower().replace(' ', '_')
+        product = entry.get('product', '').lower().replace(' ', '_')
+        # Определяем part: 'o' для OS, 'a' для приложений
+        part = 'o' if any(kw in product for kw in ('macos', 'ios', 'ipad', 'watchos', 'tvos', 'visionos')) else 'a'
+        base_cpe = f"cpe:2.3:{part}:{vendor}:{product}:*:*:*:*:*:*:*:*"
+
+        versions = entry.get('versions', [])
+        if not versions:
+            cpe_entries.append(base_cpe)
+            continue
+
+        for v in versions:
+            status = v.get('status', '')
+            ver = v.get('version', '*')
+            less_than = v.get('lessThan', '')
+            less_than_or_eq = v.get('lessThanOrEqual', '')
+            version_type = v.get('versionType', '')
+
+            if status != 'affected':
+                continue
+
+            if less_than:
+                cpe_str = f"cpe:2.3:{part}:{vendor}:{product}:*:*:*:*:*:*:*:*"
+                cpe_entries.append(f"{cpe_str} (>={ver}, <{less_than})")
+            elif less_than_or_eq:
+                cpe_str = f"cpe:2.3:{part}:{vendor}:{product}:*:*:*:*:*:*:*:*"
+                cpe_entries.append(f"{cpe_str} (>={ver}, <={less_than_or_eq})")
+            else:
+                cpe_entries.append(f"cpe:2.3:{part}:{vendor}:{product}:{ver}:*:*:*:*:*:*:*")
+
+    return list(dict.fromkeys(cpe_entries))
+
+
+def fetch_from_nvd(cve_id: str) -> tuple:
     """Возвращает (cpe_list, cwe_ids) из NVD API 2.0."""
     for attempt in range(3):
         try:
@@ -101,12 +125,9 @@ def fetch_from_nvd(cve_id: str) -> tuple[list, list]:
             for match in node.get('cpeMatch', []):
                 if not match.get('vulnerable', False):
                     continue
-
                 cpe = match.get('criteria', '')
                 if not cpe:
                     continue
-
-
                 if match.get('versionEndExcluding'):
                     cpe_entries.extend(expand_cpe_range(cpe, match['versionEndExcluding'], True))
                 elif match.get('versionEndIncluding'):
@@ -121,9 +142,33 @@ def fetch_from_nvd(cve_id: str) -> tuple[list, list]:
             if re.match(r'^CWE-\d+$', val) and val not in cwe_ids:
                 cwe_ids.append(val)
 
-
     return list(dict.fromkeys(cpe_entries)), cwe_ids
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CVSS helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_cvss_from_metrics(metrics_list: list) -> list:
+    """Извлекает CVSS из списка metrics (работает для cna.metrics и adp[].metrics)."""
+    result = []
+    for metric in metrics_list:
+        for key in ('cvssV4_0', 'cvssV3_1', 'cvssV3_0', 'cvssV2_0', 'cvssV2'):
+            if key not in metric:
+                continue
+            cd = metric[key]
+            result.append({
+                "version": key.lower().replace('_', ''),
+                "score": cd.get('baseScore', 0),
+                "vector": cd.get('vectorString', ''),
+                "severity": cd.get('baseSeverity', cd.get('severity', 'UNKNOWN'))
+            })
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Обогащение CVE
+# ══════════════════════════════════════════════════════════════════════════════
 
 def enrich_single(item: dict, index: int, total: int) -> dict | None:
     cve_id = item['ID']
@@ -141,24 +186,29 @@ def enrich_single(item: dict, index: int, total: int) -> dict | None:
     containers = data.get('containers', {})
     cna = containers.get('cna', {})
 
+    # Описание
     descs = cna.get('descriptions', [])
     desc_text = next((d.get('value', '') for d in descs if d.get('lang', '').startswith('en')),
                      descs[0].get('value', '') if descs else '')
 
+    # ── CVSS ──────────────────────────────────────────────────────────────────
+    # FIX: Apple размещает CVSS в cna.metrics, а не только в adp.metrics
     cvss_list = []
+    cvss_list.extend(extract_cvss_from_metrics(cna.get('metrics', [])))
     for adp in containers.get('adp', []):
-        for metric in adp.get('metrics', []):
-            for key in ('cvssV4_0', 'cvssV3_1', 'cvssV3_0', 'cvssV2_0', 'cvssV2'):
-                if key not in metric:
-                    continue
-                cd = metric[key]
-                cvss_list.append({
-                    "version": key.lower().replace('_', ''),
-                    "score": cd.get('baseScore', 0),
-                    "vector": cd.get('vectorString', ''),
-                    "severity": cd.get('baseSeverity', cd.get('severity', 'UNKNOWN'))
-                })
+        cvss_list.extend(extract_cvss_from_metrics(adp.get('metrics', [])))
 
+    # Убираем дубли по (version, vector)
+    seen_cvss = set()
+    unique_cvss = []
+    for c in cvss_list:
+        key = (c['version'], c['vector'])
+        if key not in seen_cvss:
+            seen_cvss.add(key)
+            unique_cvss.append(c)
+    cvss_list = unique_cvss
+
+    # ── CWE из MITRE ──────────────────────────────────────────────────────────
     cwe_ids_mitre = []
     for pt in cna.get('problemTypes', []):
         for desc in pt.get('descriptions', []):
@@ -170,7 +220,17 @@ def enrich_single(item: dict, index: int, total: int) -> dict | None:
             if cwe_id and cwe_id not in cwe_ids_mitre:
                 cwe_ids_mitre.append(cwe_id)
 
+    # ── CPE + CWE из NVD ──────────────────────────────────────────────────────
     cpe_list, cwe_ids_nvd = fetch_from_nvd(cve_id)
+
+    # FIX: если NVD не дал CPE — строим из cna.affected
+    if not cpe_list:
+        affected = cna.get('affected', [])
+        if affected:
+            cpe_list = build_cpe_from_affected(affected)
+            if cpe_list:
+                print(f"  [{cve_id}] CPE построены из cna.affected ({len(cpe_list)} шт.)")
+
     all_cwe_ids = list(dict.fromkeys(cwe_ids_mitre + cwe_ids_nvd))
 
     return {
@@ -192,7 +252,6 @@ def enrich_single(item: dict, index: int, total: int) -> dict | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_cwe_info(cwe_id: str) -> dict:
-    """Запрашивает MITRE CWE API для одного CWE ID."""
     num = re.sub(r'\D', '', cwe_id)
     url = CWE_API_URL.format(cwe_num=num)
     session = get_session()
@@ -203,11 +262,9 @@ def fetch_cwe_info(cwe_id: str) -> dict:
 
             if resp.status_code == 404:
                 return {"name": "", "description": ""}
-
             if resp.status_code == 429:
                 time.sleep(3 * (attempt + 1))
                 continue
-
             if resp.status_code != 200:
                 time.sleep(2 ** attempt)
                 continue
@@ -240,7 +297,6 @@ def fetch_cwe_info(cwe_id: str) -> dict:
 
             raw_desc = w.get('Description') or w.get('description') or ''
             desc = extract_text(raw_desc).strip()
-
             if not desc:
                 raw_ext = w.get('Extended_Description') or w.get('extended_description') or ''
                 desc = extract_text(raw_ext).strip()
@@ -254,20 +310,17 @@ def fetch_cwe_info(cwe_id: str) -> dict:
     return {"name": "", "description": ""}
 
 
-def fetch_all_cwe_details(unique_cwe_ids: list[str]) -> dict[str, dict]:
-    """Параллельно загружает данные для уникальных CWE."""
+def fetch_all_cwe_details(unique_cwe_ids: list) -> dict:
     print(f"\n{'=' * 60}")
     print(f"Загружаем данные для {len(unique_cwe_ids)} уникальных CWE (Многопоточно)...")
     print(f"{'=' * 60}")
 
-    cwe_details: dict[str, dict] = {}
-
+    cwe_details = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_CWE) as executor:
         future_to_cwe = {
             executor.submit(fetch_cwe_info, cwe_id): cwe_id
             for cwe_id in unique_cwe_ids
         }
-
         for future in as_completed(future_to_cwe):
             cwe_id = future_to_cwe[future]
             try:
@@ -296,8 +349,7 @@ def enrich_cves():
     print(f"Обогащение {total} CVE (MITRE CVE API + NVD)...")
     print(f"{'=' * 60}")
 
-    enriched: list[dict | None] = [None] * total
-
+    enriched = [None] * total
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_CVE) as executor:
         future_to_idx = {
             executor.submit(enrich_single, item, i + 1, total): i
@@ -307,18 +359,16 @@ def enrich_cves():
             idx = future_to_idx[future]
             try:
                 enriched[idx] = future.result()
-            except Exception as e:
+            except Exception:
                 pass
 
     enriched_cves = [e for e in enriched if e is not None]
 
-    # Собираем уникальные CWE
     all_cwe_ids_seen = []
     for cve in enriched_cves:
         for cwe_id in cve.get('cwe_ids', []):
             if cwe_id not in all_cwe_ids_seen:
                 all_cwe_ids_seen.append(cwe_id)
-
 
     cwe_details_map = fetch_all_cwe_details(all_cwe_ids_seen) if all_cwe_ids_seen else {}
 
@@ -332,7 +382,6 @@ def enrich_cves():
         cwe_dict = {}
         for cwe_id in cwe_ids:
             cwe_dict[cwe_id] = cwe_details_map.get(cwe_id, {"name": "", "description": ""})
-
         cve['cwe'] = cwe_dict
         result.append(cve)
 
